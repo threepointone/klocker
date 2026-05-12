@@ -1,0 +1,14 @@
+{
+  "name": "klocker",
+  "version": "1.0.0",
+  "description": "",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "bun index.ts"
+  },
+  "dependencies": {
+    "chartjs-node-canvas": "^5.0.0"
+  },
+  "type": "module"
+}
