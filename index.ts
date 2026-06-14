@@ -145,7 +145,8 @@ function weekRange(start: Date, end: Date): string[] {
 }
 
 function isPackageLockFile(filename: string): boolean {
-  return filename === "package-lock.json" || filename.endsWith("/package-lock.json");
+  return filename === "package-lock.json" || filename.endsWith("/package-lock.json") || filename.endsWith("/pnpm-lock.yaml") || filename.endsWith("/pnpm-lock.json") || filename.endsWith("/yarn.lock")
+  || filename.endsWith("/bun.lockb") || filename.endsWith("/bun.lock") || filename.endsWith("worker-configuration.d.ts")
 }
 
 async function getContributedRepos(
