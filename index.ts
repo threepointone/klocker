@@ -133,13 +133,13 @@ function weekStart(date: Date): Date {
   return start;
 }
 
-function weekRange(start: Date, end: Date): string[] {
+function dayRange(start: Date, end: Date): string[] {
   const out: string[] = [];
-  const cursor = weekStart(start);
-  const finalWeek = weekStart(end);
-  while (cursor <= finalWeek) {
+  const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  const last = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+  while (cursor <= last) {
     out.push(dateOnly(cursor));
-    cursor.setUTCDate(cursor.getUTCDate() + 7);
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
   return out;
 }
@@ -306,7 +306,7 @@ async function collectStats(
     throw new Error("No repositories found for this user.");
   }
 
-  const weekly = new Map<string, number>();
+  const daily = new Map<string, number>();
   const seenShas = new Set<string>();
   const repoList = [...repos].sort();
 
@@ -328,8 +328,8 @@ async function collectStats(
 
       try {
         const churn = await getCommitStats(client, repo, sha);
-        const week = dateOnly(weekStart(new Date(dateIso)));
-        weekly.set(week, (weekly.get(week) ?? 0) + churn);
+        const day = dateOnly(new Date(dateIso));
+        daily.set(day, (daily.get(day) ?? 0) + churn);
       } catch (error) {
         console.log(`  Skipping commit ${sha.slice(0, 7)} in ${repo}: ${String(error)}`);
       }
@@ -341,18 +341,18 @@ async function collectStats(
   }
 
   const withZeros = new Map<string, number>();
-  for (const week of weekRange(
+  for (const day of dayRange(
     new Date(Date.UTC(since.getUTCFullYear(), since.getUTCMonth(), since.getUTCDate())),
     new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())),
   )) {
-    withZeros.set(week, weekly.get(week) ?? 0);
+    withZeros.set(day, daily.get(day) ?? 0);
   }
 
   return withZeros;
 }
 
 async function writeCsv(path: string, daily: Map<string, number>): Promise<void> {
-  const rows = ["week_start,lines_changed", ...[...daily.entries()].map(([date, churn]) => `${date},${churn}`)];
+  const rows = ["date,lines_changed", ...[...daily.entries()].map(([date, churn]) => `${date},${churn}`)];
   await fs.writeFile(path, `${rows.join("\n")}\n`, "utf8");
 }
 
@@ -366,6 +366,61 @@ async function writePlot(path: string, daily: Map<string, number>, username: str
 
   const labels = [...daily.keys()];
   const values = [...daily.values()];
+
+  // Aggregate daily values into weekly totals, anchored at the first day of each
+  // week that appears in the data. These become the on-chart markers.
+  const weekGroups = new Map<string, { total: number; index: number }>();
+  labels.forEach((day, i) => {
+    const ws = dateOnly(weekStart(new Date(day)));
+    const group = weekGroups.get(ws);
+    if (group) {
+      group.total += values[i];
+    } else {
+      weekGroups.set(ws, { total: values[i], index: i });
+    }
+  });
+  const markers = [...weekGroups.values()].sort((a, b) => a.index - b.index);
+
+  const formatTotal = (n: number): string =>
+    n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(n);
+
+  const weeklyMarkerPlugin = {
+    id: "weeklyMarkers",
+    afterDatasetsDraw(chart: {
+      ctx: CanvasRenderingContext2D;
+      chartArea: { top: number; bottom: number };
+      scales: { x: { getPixelForValue: (value: number) => number } };
+    }) {
+      const { ctx, chartArea, scales } = chart;
+      const { top, bottom } = chartArea;
+      ctx.save();
+      for (const marker of markers) {
+        const px = scales.x.getPixelForValue(marker.index);
+
+        ctx.beginPath();
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = "rgba(214,39,40,0.45)";
+        ctx.lineWidth = 1;
+        ctx.moveTo(px, top);
+        ctx.lineTo(px, bottom);
+        ctx.stroke();
+
+        ctx.setLineDash([]);
+        ctx.fillStyle = "#d62728";
+        ctx.beginPath();
+        ctx.arc(px, top, 3, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.font = "bold 11px sans-serif";
+        ctx.fillStyle = "#d62728";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(formatTotal(marker.total), px, top - 5);
+      }
+      ctx.restore();
+    },
+  };
+
   const chart = new ChartJSNodeCanvas({ width: 1400, height: 600, backgroundColour: "white" });
 
   const image = await chart.renderToBuffer({
@@ -374,31 +429,35 @@ async function writePlot(path: string, daily: Map<string, number>, username: str
       labels,
       datasets: [
         {
-          label: "Lines changed (additions + deletions)",
+          label: "Lines changed per day (additions + deletions)",
           data: values,
           borderColor: "#1f77b4",
           backgroundColor: "rgba(31,119,180,0.2)",
-          borderWidth: 2,
+          borderWidth: 1.5,
           fill: true,
           pointRadius: 0,
-          tension: 0.2,
+          tension: 0.15,
         },
       ],
     },
     options: {
       responsive: false,
+      layout: {
+        padding: { top: 28 },
+      },
       plugins: {
         title: {
           display: true,
-          text: `Weekly line churn for @${username} (last ${labels.length} weeks)`,
+          text: `Daily line churn for @${username} (last ${labels.length} days, red markers = weekly totals)`,
           font: { size: 18 },
+          padding: { top: 8, bottom: 28 },
         },
-        legend: { display: true },
+        legend: { display: true, position: "bottom" },
       },
       scales: {
         x: {
           ticks: {
-            maxTicksLimit: 12,
+            maxTicksLimit: 14,
           },
           title: {
             display: true,
@@ -414,6 +473,7 @@ async function writePlot(path: string, daily: Map<string, number>, username: str
         },
       },
     },
+    plugins: [weeklyMarkerPlugin],
   });
 
   await fs.writeFile(path, image);
