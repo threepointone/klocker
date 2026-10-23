@@ -2,7 +2,9 @@
 
 This project includes a TypeScript script that estimates a user's **daily lines changed**
 (`additions + deletions`) over the last 12 months (or any window you choose). The chart plots
-daily churn as a line, with red markers at the start of each week labeled with that week's total.
+daily churn as a line, with red markers labeled with bucket totals. Buckets are **weekly** for
+shorter windows and switch to **monthly** for long windows (> ~6 months) so labels stay readable;
+overlapping labels are also automatically skipped.
 
 By default, changes in files named `package-lock.json` are excluded from totals.
 
@@ -51,6 +53,17 @@ Skip PNG output:
 ```bash
 bun start -- <github_username> --no-plot
 ```
+
+## Caching
+
+Per-day churn is cached to `.churn-cache.json` (override with `--cache <path>`,
+disable with `--no-cache`). Only days **older than a week** are cached, since
+recent days can still receive new commits or amends and are always refetched.
+
+Runs only fetch the days they're missing. For example, after running `--months 1`,
+a later `--months 12` run fetches just the missing ~11 months (plus the
+always-fresh last week) and reuses the cached month in between. Fetched days with
+no activity are cached as `0` so they aren't refetched either.
 
 ## Notes / limitations
 

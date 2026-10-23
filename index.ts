@@ -14,6 +14,8 @@ type CliArgs = {
   plot: string;
   noPlot: boolean;
   sleepBetweenCalls: number;
+  cache: string;
+  noCache: boolean;
 };
 
 function usage(): string {
@@ -29,6 +31,8 @@ function usage(): string {
     "  --plot <path>              PNG output path (default: weekly_churn.png)",
     "  --no-plot                  Skip generating PNG output",
     "  --sleep-between-calls <n>  Sleep between commit detail calls in seconds",
+    "  --cache <path>             Cache file for finalized daily churn (default: .churn-cache.json)",
+    "  --no-cache                 Disable reading/writing the cache",
   ].join("\n");
 }
 
@@ -62,6 +66,8 @@ function parseArgs(argv: string[]): CliArgs {
     plot: getValue("--plot") ?? "weekly_churn.png",
     noPlot: argv.includes("--no-plot"),
     sleepBetweenCalls: Number.isFinite(sleepBetweenCalls) ? sleepBetweenCalls : 0,
+    cache: getValue("--cache") ?? ".churn-cache.json",
+    noCache: argv.includes("--no-cache"),
   };
 }
 
@@ -133,6 +139,12 @@ function weekStart(date: Date): Date {
   return start;
 }
 
+function monthStart(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
+}
+
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
 function dayRange(start: Date, end: Date): string[] {
   const out: string[] = [];
   const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
@@ -188,6 +200,31 @@ async function getContributedRepos(
     const repository = item.repository as Record<string, unknown>;
     const name = repository.nameWithOwner as string;
     if (name) repos.add(name);
+  }
+
+  return repos;
+}
+
+// GitHub's contributionsCollection only accepts a window of at most one year, so
+// split longer spans into <=1-year chunks and union the repos found in each.
+async function getContributedReposChunked(
+  client: GitHubClient,
+  username: string,
+  since: Date,
+  until: Date,
+  maxRepos: number,
+): Promise<Set<string>> {
+  const repos = new Set<string>();
+
+  // One day under a year keeps us safely inside GitHub's inclusive limit.
+  const MAX_WINDOW_MS = 364 * 24 * 60 * 60 * 1000;
+
+  let windowStart = new Date(since);
+  while (windowStart < until) {
+    const windowEnd = new Date(Math.min(windowStart.getTime() + MAX_WINDOW_MS, until.getTime()));
+    const chunk = await getContributedRepos(client, username, windowStart, windowEnd, maxRepos);
+    for (const repo of chunk) repos.add(repo);
+    windowStart = new Date(windowEnd.getTime() + 1);
   }
 
   return repos;
@@ -277,48 +314,107 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function collectStats(
+const CACHE_VERSION = 1;
+
+// Days are considered "finalized" (safe to cache) once they are strictly more
+// than this many days in the past. Anything more recent can still receive new
+// commits / amends, so it is always refetched.
+const FINALIZED_AFTER_DAYS = 7;
+
+type ChurnCache = {
+  version: number;
+  // username -> { "YYYY-MM-DD": lines_changed }
+  users: Record<string, Record<string, number>>;
+};
+
+function emptyCache(): ChurnCache {
+  return { version: CACHE_VERSION, users: {} };
+}
+
+async function loadCache(path: string): Promise<ChurnCache> {
+  try {
+    const raw = await fs.readFile(path, "utf8");
+    const parsed = JSON.parse(raw) as Partial<ChurnCache>;
+    if (parsed && parsed.version === CACHE_VERSION && parsed.users && typeof parsed.users === "object") {
+      return { version: CACHE_VERSION, users: parsed.users };
+    }
+    // Unknown / incompatible cache: start fresh rather than trusting it.
+    return emptyCache();
+  } catch {
+    // Missing or unreadable cache file: treat as empty.
+    return emptyCache();
+  }
+}
+
+async function saveCache(path: string, cache: ChurnCache): Promise<void> {
+  await fs.writeFile(path, `${JSON.stringify(cache)}\n`, "utf8");
+}
+
+// Day (YYYY-MM-DD) -> Date at UTC midnight.
+function dayToDate(day: string): Date {
+  return new Date(`${day}T00:00:00.000Z`);
+}
+
+// Group a list of (day, needsFetch) into contiguous runs of days that need
+// fetching. Returns inclusive [firstDay, lastDay] string pairs.
+function contiguousFetchRanges(days: string[], needsFetch: boolean[]): Array<[string, string]> {
+  const ranges: Array<[string, string]> = [];
+  let start: string | null = null;
+
+  for (let i = 0; i < days.length; i += 1) {
+    if (needsFetch[i]) {
+      if (start === null) start = days[i];
+    } else if (start !== null) {
+      ranges.push([start, days[i - 1]]);
+      start = null;
+    }
+  }
+  if (start !== null) {
+    ranges.push([start, days[days.length - 1]]);
+  }
+  return ranges;
+}
+
+// Fetch per-day churn for a single date range by discovering repos, listing the
+// user's commits, and summing per-commit churn. Does not zero-fill; only days
+// with activity are present in the returned map.
+async function fetchRangeDaily(
   client: GitHubClient,
   username: string,
-  months: number,
   maxRepos: number,
   sleepBetweenCalls: number,
+  since: Date,
+  until: Date,
 ): Promise<Map<string, number>> {
-  const now = new Date();
-  const since = new Date(now);
-  since.setUTCDate(since.getUTCDate() - months * 30);
-
   let repos: Set<string>;
   try {
-    repos = await getContributedRepos(client, username, since, now, maxRepos);
+    repos = await getContributedReposChunked(client, username, since, until, maxRepos);
     if (repos.size > 0) {
-      console.log(`Found ${repos.size} repositories from contribution graph.`);
+      console.log(`  Found ${repos.size} repositories from contribution graph.`);
     } else {
-      console.log("Contribution graph returned no repositories; falling back to owned repos.");
+      console.log("  Contribution graph returned no repositories; falling back to owned repos.");
       repos = await getOwnedRepos(client, username);
     }
   } catch (error) {
-    console.log(`GraphQL lookup failed (${String(error)}); falling back to owned repos.`);
+    console.log(`  GraphQL lookup failed (${String(error)}); falling back to owned repos.`);
     repos = await getOwnedRepos(client, username);
   }
 
-  if (repos.size === 0) {
-    throw new Error("No repositories found for this user.");
-  }
-
   const daily = new Map<string, number>();
+  if (repos.size === 0) return daily;
+
   const seenShas = new Set<string>();
   const repoList = [...repos].sort();
 
   for (let i = 0; i < repoList.length; i += 1) {
     const repo = repoList[i];
-    console.log(`[${i + 1}/${repoList.length}] Scanning commits in ${repo} ...`);
+    console.log(`  [${i + 1}/${repoList.length}] Scanning commits in ${repo} ...`);
 
     let commits: Array<{ sha: string; dateIso: string }> = [];
     try {
-      commits = await getRepoCommits(client, repo, username, since, now);
+      commits = await getRepoCommits(client, repo, username, since, until);
     } catch (error) {
-      console.log(`  Skipping ${repo}: ${String(error)}`);
+      console.log(`    Skipping ${repo}: ${String(error)}`);
       continue;
     }
 
@@ -331,7 +427,7 @@ async function collectStats(
         const day = dateOnly(new Date(dateIso));
         daily.set(day, (daily.get(day) ?? 0) + churn);
       } catch (error) {
-        console.log(`  Skipping commit ${sha.slice(0, 7)} in ${repo}: ${String(error)}`);
+        console.log(`    Skipping commit ${sha.slice(0, 7)} in ${repo}: ${String(error)}`);
       }
 
       if (sleepBetweenCalls > 0) {
@@ -340,12 +436,101 @@ async function collectStats(
     }
   }
 
+  return daily;
+}
+
+async function collectStats(
+  client: GitHubClient,
+  username: string,
+  months: number,
+  maxRepos: number,
+  sleepBetweenCalls: number,
+  cachePath: string | null,
+): Promise<Map<string, number>> {
+  const now = new Date();
+  const since = new Date(now);
+  since.setUTCDate(since.getUTCDate() - months * 30);
+
+  // Days strictly before this are "finalized" and may be served from / written
+  // to the cache. Days on or after it are always refetched.
+  const finalizedBefore = new Date(now);
+  finalizedBefore.setUTCDate(finalizedBefore.getUTCDate() - FINALIZED_AFTER_DAYS);
+  const finalizedBeforeDay = dateOnly(finalizedBefore);
+
+  const cache = cachePath ? await loadCache(cachePath) : emptyCache();
+  const cachedDays = cache.users[username] ?? {};
+
+  const allDays = dayRange(
+    dayToDate(dateOnly(since)),
+    dayToDate(dateOnly(now)),
+  );
+
+  // Decide, per day, whether we must fetch it. A finalized day already present
+  // in the cache is reused; everything else (cache misses + the recent,
+  // not-yet-finalized window) is fetched.
+  const merged = new Map<string, number>();
+  let cacheHits = 0;
+  const needsFetch = allDays.map((day) => {
+    const finalized = day < finalizedBeforeDay;
+    if (finalized && Object.prototype.hasOwnProperty.call(cachedDays, day)) {
+      merged.set(day, cachedDays[day]);
+      cacheHits += 1;
+      return false;
+    }
+    return true;
+  });
+
+  // Collapse the missing days into contiguous ranges so a request for, say,
+  // "12 months" after a cached "1 month" only fetches the missing 11 months
+  // (plus the always-fresh last week), skipping the cached middle entirely.
+  const fetchRanges = contiguousFetchRanges(allDays, needsFetch);
+
+  if (cachePath) {
+    console.log(
+      `Cache: ${cacheHits} finalized day(s) reused from ${cachePath}; ` +
+        `${fetchRanges.length} range(s) to fetch.`,
+    );
+  }
+
+  for (const [startDay, endDay] of fetchRanges) {
+    const rangeSince = dayToDate(startDay);
+    // Use `now` as the upper bound when the range reaches today so we capture
+    // the very latest commits; otherwise cover the whole final day.
+    const rangeUntil =
+      endDay === dateOnly(now) ? now : new Date(`${endDay}T23:59:59.999Z`);
+
+    console.log(`Fetching ${startDay} .. ${endDay} ...`);
+    const rangeDaily = await fetchRangeDaily(
+      client,
+      username,
+      maxRepos,
+      sleepBetweenCalls,
+      rangeSince,
+      rangeUntil,
+    );
+
+    for (const [day, churn] of rangeDaily) {
+      merged.set(day, (merged.get(day) ?? 0) + churn);
+    }
+  }
+
+  // Zero-fill the full window so every requested day has a value.
   const withZeros = new Map<string, number>();
-  for (const day of dayRange(
-    new Date(Date.UTC(since.getUTCFullYear(), since.getUTCMonth(), since.getUTCDate())),
-    new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())),
-  )) {
-    withZeros.set(day, daily.get(day) ?? 0);
+  for (const day of allDays) {
+    withZeros.set(day, merged.get(day) ?? 0);
+  }
+
+  // Persist finalized days (including fetched zero-churn days, so they count as
+  // covered and are not refetched next time).
+  if (cachePath) {
+    const updated = { ...cachedDays };
+    for (const [day, churn] of withZeros) {
+      if (day < finalizedBeforeDay) {
+        updated[day] = churn;
+      }
+    }
+    cache.users[username] = updated;
+    await saveCache(cachePath, cache);
   }
 
   return withZeros;
@@ -356,7 +541,7 @@ async function writeCsv(path: string, daily: Map<string, number>): Promise<void>
   await fs.writeFile(path, `${rows.join("\n")}\n`, "utf8");
 }
 
-async function writePlot(path: string, daily: Map<string, number>, username: string): Promise<void> {
+export async function writePlot(path: string, daily: Map<string, number>, username: string): Promise<void> {
   let ChartJSNodeCanvas: typeof import("chartjs-node-canvas").ChartJSNodeCanvas;
   try {
     ({ ChartJSNodeCanvas } = await import("chartjs-node-canvas"));
@@ -367,33 +552,49 @@ async function writePlot(path: string, daily: Map<string, number>, username: str
   const labels = [...daily.keys()];
   const values = [...daily.values()];
 
-  // Aggregate daily values into weekly totals, anchored at the first day of each
-  // week that appears in the data. These become the on-chart markers.
-  const weekGroups = new Map<string, { total: number; index: number }>();
+  // For long windows weekly markers overlap, so aggregate into monthly buckets
+  // instead. Short windows keep finer weekly buckets.
+  const useMonthly = labels.length > 182; // ~6 months
+  const bucketUnit = useMonthly ? "monthly" : "weekly";
+
+  const bucketStart = (day: string): Date =>
+    useMonthly ? monthStart(new Date(day)) : weekStart(new Date(day));
+
+  const bucketLabel = (start: Date): string =>
+    useMonthly
+      ? `${MONTH_ABBR[start.getUTCMonth()]} ${String(start.getUTCFullYear()).slice(2)}`
+      : dateOnly(start).slice(5); // MM-DD
+
+  // Aggregate daily values into bucket totals, anchored at the first day of each
+  // bucket that appears in the data. These become the on-chart markers.
+  const groups = new Map<string, { total: number; index: number; label: string }>();
   labels.forEach((day, i) => {
-    const ws = dateOnly(weekStart(new Date(day)));
-    const group = weekGroups.get(ws);
+    const start = bucketStart(day);
+    const key = dateOnly(start);
+    const group = groups.get(key);
     if (group) {
       group.total += values[i];
     } else {
-      weekGroups.set(ws, { total: values[i], index: i });
+      groups.set(key, { total: values[i], index: i, label: bucketLabel(start) });
     }
   });
-  const markers = [...weekGroups.values()].sort((a, b) => a.index - b.index);
+  const markers = [...groups.values()].sort((a, b) => a.index - b.index);
 
   const formatTotal = (n: number): string =>
     n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(n);
 
-  const weeklyMarkerPlugin = {
-    id: "weeklyMarkers",
+  const markerPlugin = {
+    id: "churnMarkers",
     afterDatasetsDraw(chart: {
       ctx: CanvasRenderingContext2D;
       chartArea: { top: number; bottom: number };
-      scales: { x: { getPixelForValue: (value: number) => number } };
+      scales: { [key: string]: { getPixelForValue: (value: number) => number } };
     }) {
       const { ctx, chartArea, scales } = chart;
       const { top, bottom } = chartArea;
       ctx.save();
+
+      // Draw all gridlines + dots first.
       for (const marker of markers) {
         const px = scales.x.getPixelForValue(marker.index);
 
@@ -410,12 +611,24 @@ async function writePlot(path: string, daily: Map<string, number>, username: str
         ctx.beginPath();
         ctx.arc(px, top, 3, 0, Math.PI * 2);
         ctx.fill();
+      }
 
-        ctx.font = "bold 11px sans-serif";
-        ctx.fillStyle = "#d62728";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "bottom";
-        ctx.fillText(formatTotal(marker.total), px, top - 5);
+      // Then draw labels, skipping any that would overlap the previous one so
+      // text never collides regardless of how many buckets there are.
+      ctx.font = "bold 11px sans-serif";
+      ctx.fillStyle = "#d62728";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      const MIN_LABEL_GAP = 6;
+      let lastLabelRight = -Infinity;
+      for (const marker of markers) {
+        const px = scales.x.getPixelForValue(marker.index);
+        const text = formatTotal(marker.total);
+        const halfWidth = ctx.measureText(text).width / 2;
+        if (px - halfWidth > lastLabelRight + MIN_LABEL_GAP) {
+          ctx.fillText(text, px, top - 5);
+          lastLabelRight = px + halfWidth;
+        }
       }
       ctx.restore();
     },
@@ -448,7 +661,7 @@ async function writePlot(path: string, daily: Map<string, number>, username: str
       plugins: {
         title: {
           display: true,
-          text: `Daily line churn for @${username} (last ${labels.length} days, red markers = weekly totals)`,
+          text: `Daily line churn for @${username} (last ${labels.length} days, red markers = ${bucketUnit} totals)`,
           font: { size: 18 },
           padding: { top: 8, bottom: 28 },
         },
@@ -457,7 +670,14 @@ async function writePlot(path: string, daily: Map<string, number>, username: str
       scales: {
         x: {
           ticks: {
-            maxTicksLimit: 14,
+            maxTicksLimit: useMonthly ? 24 : 14,
+            autoSkip: true,
+            maxRotation: 0,
+            callback(this: { getLabelForValue: (v: number) => string }, value: string | number) {
+              const day = this.getLabelForValue(Number(value));
+              // Show "Mon 'YY" on long charts, otherwise the raw date.
+              return useMonthly ? bucketLabel(monthStart(new Date(day))) : day;
+            },
           },
           title: {
             display: true,
@@ -473,7 +693,7 @@ async function writePlot(path: string, daily: Map<string, number>, username: str
         },
       },
     },
-    plugins: [weeklyMarkerPlugin],
+    plugins: [markerPlugin],
   });
 
   await fs.writeFile(path, image);
@@ -489,7 +709,14 @@ async function main(): Promise<void> {
     );
   }
 
-  const daily = await collectStats(client, args.username, args.months, args.maxRepos, args.sleepBetweenCalls);
+  const daily = await collectStats(
+    client,
+    args.username,
+    args.months,
+    args.maxRepos,
+    args.sleepBetweenCalls,
+    args.noCache ? null : args.cache,
+  );
 
   await writeCsv(args.csv, daily);
   console.log(`Wrote CSV: ${args.csv}`);
@@ -505,7 +732,9 @@ async function main(): Promise<void> {
   console.log(`Active days: ${activeDays} / ${daily.size}`);
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

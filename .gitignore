@@ -144,3 +144,6 @@ vite.config.ts.timestamp-*
 
 # Generated churn output
 weekly_churn.*
+
+# Churn daily-data cache
+.churn-cache.json
